@@ -73,7 +73,7 @@ const MAX_PARAGRAPH_WORDS = 120;
 const WORDS_PER_SECOND = 2.6;
 const MIN_WORDS_FOR_TEXT_PDF = 30;
 const MAX_OCR_BYTES = 15 * 1024 * 1024;
-const TRANSLATION_BATCH_SIZE = 20;
+const TRANSLATION_BATCH_SIZE = 8;
 const CACHE_MAX_ENTRIES = 60;
 
 const GEMINI_MODELS = ['gemini-3.1-flash-lite', 'gemini-3.8-flash'] as const;
@@ -307,12 +307,45 @@ async function askGroq(prompt: string): Promise<Record<string, unknown> | null> 
     const groq = new Groq({ apiKey: ENV.GROQ_API_KEY });
     const completion = await groq.chat.completions.create({
       model: GROQ_MODEL,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are a professional translator. You must output strictly valid JSON with root object containing key "items": {"items":[{"title":"...","text":"..."}]}.',
+        },
+        { role: 'user', content: prompt },
+      ],
       response_format: { type: 'json_object' },
+      max_tokens: 4096,
+      temperature: 0.1,
     });
     return parseJson(completion.choices[0]?.message?.content || '');
   } catch (err) {
     console.warn('[Transcript/Groq]', (err as Error).message.slice(0, 140));
+    return null;
+  }
+}
+
+async function askOpenRouter(prompt: string): Promise<Record<string, unknown> | null> {
+  if (!ENV.OPENROUTER_API_KEY) return null;
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${ENV.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'openai/gpt-oss-120b',
+        messages: [{ role: 'user', content: prompt }],
+        response_format: { type: 'json_object' },
+      }),
+    });
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const content = data?.choices?.[0]?.message?.content || '';
+    return parseJson(content);
+  } catch (err) {
+    console.warn('[Transcript/OpenRouter]', (err as Error).message.slice(0, 140));
     return null;
   }
 }
@@ -347,15 +380,25 @@ async function translateBatch(
   target: TranscriptLanguage,
 ): Promise<RawParagraph[] | null> {
   const payload = JSON.stringify(batch.map((p) => ({ title: p.title || '', text: p.text })));
-  const prompt = `Traduis en ${LANGUAGE_NAMES[target]} chaque élément de ce tableau JSON (champs "title" et "text").
-Conserve exactement le même nombre d'éléments et le même ordre. Garde les formules, nombres et noms propres intacts. Laisse "title" vide s'il est vide.
-Réponds STRICTEMENT avec ce JSON : {"items":[{"title":"...","text":"..."}]}
+  const prompt = `You are an expert academic translator. Translate each item in the following JSON array into ${LANGUAGE_NAMES[target]}.
+Preserve the exact same order and count of items. Keep formulas, code, numbers, acronyms, and proper names intact.
+Return STRICTLY valid JSON with key "items":
+{"items":[{"title":"...","text":"..."}]}
 
+Input array:
 ${payload}`;
 
-  const parsed = (await askGroq(prompt)) || (await askGemini(prompt));
-  const items = readParagraphArray(parsed?.items);
-  if (items.length !== batch.length) return null;
+  const parsed =
+    (await askGroq(prompt)) || (await askOpenRouter(prompt)) || (await askGemini(prompt));
+  let items = readParagraphArray(parsed?.items);
+  if (items.length === 0) return null;
+  if (items.length < batch.length) {
+    for (let i = items.length; i < batch.length; i++) {
+      items.push(batch[i]);
+    }
+  } else if (items.length > batch.length) {
+    items = items.slice(0, batch.length);
+  }
   return items;
 }
 
@@ -367,9 +410,13 @@ async function translateParagraphs(
   for (let i = 0; i < paragraphs.length; i += TRANSLATION_BATCH_SIZE) {
     batches.push(paragraphs.slice(i, i + TRANSLATION_BATCH_SIZE));
   }
-  const results = await Promise.all(batches.map((b) => translateBatch(b, target)));
-  if (results.some((r) => r === null)) return null;
-  return results.flat() as RawParagraph[];
+  const results: RawParagraph[][] = [];
+  for (const b of batches) {
+    const res = await translateBatch(b, target);
+    if (!res) return null;
+    results.push(res);
+  }
+  return results.flat();
 }
 
 /* -------------------------------------------------------------------------- */

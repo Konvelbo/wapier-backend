@@ -1,7 +1,9 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { hashPassword, verifyPassword } from '../services/auth/password';
+import { CloudflareD1 } from '../services/db/cloudflareD1';
 import { Store } from '../services/db/store';
+import { ENV } from '../config/env';
 
 export const authRouter = Router();
 
@@ -68,7 +70,31 @@ authRouter.post('/login', async (req, res) => {
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    const user = Store.getUserByEmail(cleanEmail);
+    let user = Store.getUserByEmail(cleanEmail);
+
+    if (!user && CloudflareD1.isConfigured()) {
+      try {
+        const rows = await CloudflareD1.query<{
+          user_id: string;
+          email: string | null;
+          password_hash: string | null;
+          name: string | null;
+        }>(
+          'SELECT user_id, email, password_hash, name FROM wapier_users WHERE LOWER(email) = ?',
+          [cleanEmail],
+        );
+        if (rows[0] && rows[0].password_hash) {
+          user = {
+            userId: rows[0].user_id,
+            email: rows[0].email || cleanEmail,
+            passwordHash: rows[0].password_hash,
+            name: rows[0].name || null,
+          };
+        }
+      } catch (dbErr) {
+        console.warn('[Auth Backend] Erreur recherche utilisateur Cloudflare D1 :', dbErr);
+      }
+    }
 
     if (!user || !user.passwordHash) {
       res.status(401).json({ error: 'Email ou mot de passe incorrect.' });
@@ -81,11 +107,35 @@ authRouter.post('/login', async (req, res) => {
       return;
     }
 
+    let signInToken: string | null = null;
+    if (ENV.CLERK_SECRET_KEY) {
+      try {
+        const tokenRes = await fetch('https://api.clerk.com/v1/sign_in_tokens', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${ENV.CLERK_SECRET_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            user_id: user.userId,
+            expires_in_seconds: 86400,
+          }),
+        });
+        const tokenData = (await tokenRes.json()) as { token?: string };
+        if (tokenData && tokenData.token) {
+          signInToken = tokenData.token;
+        }
+      } catch (tokenErr) {
+        console.warn('[Auth Backend] Erreur génération ticket Clerk :', tokenErr);
+      }
+    }
+
     res.status(200).json({
       success: true,
       userId: user.userId,
       email: user.email,
       name: user.name,
+      signInToken,
     });
   } catch (err) {
     console.error('[Auth Backend] Erreur connexion :', err);
