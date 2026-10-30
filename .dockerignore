@@ -1,0 +1,8 @@
+node_modules
+dist
+.sessions
+.temp_files
+data
+.env
+.git
+npm-debug.log
